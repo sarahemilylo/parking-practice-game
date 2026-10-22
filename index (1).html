@@ -1,0 +1,1370 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Parking Practice</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #1a1a2e;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      font-family: 'Segoe UI', Arial, sans-serif;
+      color: #eee;
+    }
+    h1 {
+      font-size: 1.3rem;
+      letter-spacing: 0.15em;
+      margin-bottom: 8px;
+      color: #aad4ff;
+      text-transform: uppercase;
+    }
+    canvas {
+      display: block;
+      border: 2px solid #334;
+      box-shadow: 0 0 30px #0008;
+    }
+    #legend {
+      margin-top: 8px;
+      font-size: 0.72rem;
+      color: #778;
+      letter-spacing: 0.05em;
+    }
+  </style>
+</head>
+<body>
+  <h1>Parking Practice</h1>
+  <canvas id="c" width="900" height="600"></canvas>
+  <div id="legend">
+    ↑ Gas · ↓/Space Brake · ←/→ Steer &nbsp;|&nbsp; D Drive · R Reverse · P Park &nbsp;|&nbsp; ⌫ Reset
+  </div>
+
+  <script>
+  // ─────────────────────────────────────────────────────────────────────────
+  //  CONSTANTS & TUNING
+  // ─────────────────────────────────────────────────────────────────────────
+  const CAR_W         = 27.5;      // car width (px)
+  const CAR_L         = 55;        // car length (px)
+  const WHEELBASE     = 42.5;      // distance between axles (px) — affects turn radius
+  const BIG           = 1.25;      // car-size multiplier for the "larger vehicles" levels (10–12)
+  const MAX_SPEED_FWD = 120;       // px/s forward max
+  const MAX_SPEED_REV = 60;        // px/s reverse max
+  const ACCEL         = 90;        // px/s² throttle acceleration
+  const FRICTION      = 140;       // px/s² natural drag (coasting only) — quick roll-to-stop
+  const BRAKE_DECEL   = 200;       // px/s² braking deceleration
+  const MAX_STEER     = 0.30;      // radians (~17°) max steer angle
+  const STEER_RATE    = 2.2;       // rad/s steer angle change rate
+  const STEER_RETURN  = 3.5;       // rad/s auto-center rate when no steer key
+  const SHIFT_SPEED   = 8;         // px/s — must be slower than this to change gear
+
+  const CANVAS_W      = 900;
+  const CANVAS_H      = 600;
+
+  // Bay colours
+  const CLR_ASPHALT   = '#3a3a3a';
+  const CLR_LINE      = '#ffffffcc';
+  const CLR_BAY_IDLE  = 'rgba(80,180,80,0.18)';
+  const CLR_BAY_OK    = 'rgba(50,220,50,0.55)';
+  const CLR_BAY_HIT   = 'rgba(220,50,50,0.35)';
+  const CLR_PARKED_CAR= '#555e6e';
+  const CLR_CAR_BODY  = '#3b82f6';
+  const CLR_CAR_NOSE  = '#f97316';
+
+  // Success thresholds
+  const HEADING_TOL   = 0.14;      // ~8 degrees
+  const SPEED_TOL     = 5;         // px/s
+  const HIT_FLASH_MS  = 600;
+
+  // ─────────────────────────────────────────────────────────────────────────
+  //  MODE DEFINITIONS
+  //  Each mode: startPose, targetBay {x,y,w,h,heading}, obstacles[]
+  //  Heading: 0 = right (+x), π/2 = down (+y), -π/2 = up (-y)
+  //  Obstacles: {x,y,w,h} axis-aligned rectangles (center coords)
+  // ─────────────────────────────────────────────────────────────────────────
+  const DEG = Math.PI / 180;
+
+  const MODES = {
+    1: {
+      name: 'Perpendicular — Front In (nose into bay)',
+      // Bay row at top-centre, player starts below facing up (heading = -π/2)
+      // Desired parking heading: -π/2 (nose pointing up into bay)
+      startPose: { x: 450, y: 430, heading: -Math.PI / 2 },
+      targetBay: { x: 450, y: 140, w: 60, h: 110, heading: -Math.PI / 2 },
+      obstacles: [
+        // Parked cars filling every bay except the target (450), aligned to bay centres.
+        // Same dimensions as the player car (CAR_W × CAR_L), oriented vertically.
+        { x: 270, y: 170, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 330, y: 170, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 390, y: 170, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 510, y: 170, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 570, y: 170, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 630, y: 170, w: CAR_W, h: CAR_L, label: 'car' },
+        // Lot boundary walls (thin, wide)
+        { x: 450, y: 80,  w: 900, h: 14, label: 'wall' },   // top wall
+        { x: 450, y: 598, w: 900, h: 8,  label: 'wall' },   // bottom wall
+        { x: 2,   y: 300, w: 8,  h: 600, label: 'wall' },   // left wall
+        { x: 898, y: 300, w: 8,  h: 600, label: 'wall' },   // right wall
+      ],
+    },
+
+    2: {
+      name: 'Perpendicular — Back In (reverse into bay)',
+      // Same bay layout but player starts facing DOWN (heading = π/2) → must reverse in
+      startPose: { x: 450, y: 390, heading: Math.PI / 2 },
+      targetBay: { x: 450, y: 140, w: 60, h: 110, heading: -Math.PI / 2 },
+      obstacles: [
+        { x: 270, y: 170, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 330, y: 170, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 390, y: 170, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 510, y: 170, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 570, y: 170, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 630, y: 170, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 450, y: 80,  w: 900, h: 14, label: 'wall' },
+        { x: 450, y: 598, w: 900, h: 8,  label: 'wall' },
+        { x: 2,   y: 300, w: 8,  h: 600, label: 'wall' },
+        { x: 898, y: 300, w: 8,  h: 600, label: 'wall' },
+      ],
+    },
+
+    3: {
+      name: 'Parallel Parking (alongside curb)',
+      // Two parked cars along right curb with a gap; player starts in lane to the left
+      // Desired heading: 0 (car aligned horizontally, nose pointing right)
+      startPose: { x: 200, y: 420, heading: 0 },
+      targetBay: { x: 720, y: 470, w: 110, h: 52, heading: 0 },
+      obstacles: [
+        // Car in front of spot (inner edge at the 775 marker)
+        { x: 802.5, y: 470, w: CAR_L, h: CAR_W, label: 'car' },
+        // Car behind spot (inner edge at the 665 marker)
+        { x: 637.5, y: 470, w: CAR_L, h: CAR_W, label: 'car' },
+        // Right curb / sidewalk wall
+        { x: 450, y: 510, w: 900, h: 18, label: 'wall' },
+        // Left road edge
+        { x: 450, y: 340, w: 900, h: 12, label: 'wall' },
+        // Lot boundary left/right
+        { x: 2,   y: 300, w: 8,  h: 600, label: 'wall' },
+        { x: 898, y: 300, w: 8,  h: 600, label: 'wall' },
+      ],
+    },
+
+    4: {
+      name: 'Perpendicular — Drive In from the Side',
+      // Same bay row as levels 1/2 (target at 450). Player starts off to the LEFT in
+      // the aisle, facing along it (heading 0), and must arc up into the bay nose-first.
+      startPose: { x: 250, y: 250, heading: 0 },
+      targetBay: { x: 450, y: 140, w: 60, h: 110, heading: -Math.PI / 2 },
+      obstacles: [
+        { x: 270, y: 170, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 330, y: 170, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 390, y: 170, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 510, y: 170, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 570, y: 170, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 630, y: 170, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 450, y: 80,  w: 900, h: 14, label: 'wall' },
+        { x: 450, y: 598, w: 900, h: 8,  label: 'wall' },
+        { x: 2,   y: 300, w: 8,  h: 600, label: 'wall' },
+        { x: 898, y: 300, w: 8,  h: 600, label: 'wall' },
+      ],
+    },
+
+    5: {
+      name: 'Perpendicular — Reverse In from the Side',
+      // Same bay row. Player starts off to the RIGHT, having "pulled past" the bay,
+      // facing along the aisle (heading 0). Must shift to R and back into the bay,
+      // swinging the rear in. (Heading check accepts the nose-out finish.)
+      startPose: { x: 640, y: 250, heading: 0 },
+      targetBay: { x: 450, y: 140, w: 60, h: 110, heading: -Math.PI / 2 },
+      obstacles: [
+        { x: 270, y: 170, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 330, y: 170, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 390, y: 170, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 510, y: 170, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 570, y: 170, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 630, y: 170, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 450, y: 80,  w: 900, h: 14, label: 'wall' },
+        { x: 450, y: 598, w: 900, h: 8,  label: 'wall' },
+        { x: 2,   y: 300, w: 8,  h: 600, label: 'wall' },
+        { x: 898, y: 300, w: 8,  h: 600, label: 'wall' },
+      ],
+    },
+
+    6: {
+      name: 'Parallel Parking — Tight to the Curb',
+      // Like level 3, but the spot and parked cars sit right against the curb (y=485
+      // instead of 470), so the player must tuck in tight rather than leaving a gap.
+      startPose: { x: 200, y: 420, heading: 0 },
+      targetBay: { x: 720, y: 485, w: 110, h: 52, heading: 0 },
+      obstacles: [
+        // Car in front of spot (inner edge at the 775 marker)
+        { x: 802.5, y: 485, w: CAR_L, h: CAR_W, label: 'car' },
+        // Car behind spot (inner edge at the 665 marker)
+        { x: 637.5, y: 485, w: CAR_L, h: CAR_W, label: 'car' },
+        // Right curb / sidewalk wall
+        { x: 450, y: 510, w: 900, h: 18, label: 'wall' },
+        // Left road edge
+        { x: 450, y: 340, w: 900, h: 12, label: 'wall' },
+        // Lot boundary left/right
+        { x: 2,   y: 300, w: 8,  h: 600, label: 'wall' },
+        { x: 898, y: 300, w: 8,  h: 600, label: 'wall' },
+      ],
+    },
+
+    7: {
+      name: 'Parallel Parking — Cars Across the Street',
+      // Like level 3, but a row of cars is parked along the OPPOSITE curb (y≈374),
+      // narrowing the street so the nose can't swing wide — a tighter maneuver.
+      startPose: { x: 200, y: 430, heading: 0 },
+      targetBay: { x: 720, y: 470, w: 110, h: 52, heading: 0 },
+      obstacles: [
+        // Spot cars (along the right/bottom curb)
+        { x: 802.5, y: 470, w: CAR_L, h: CAR_W, label: 'car' },
+        { x: 637.5, y: 470, w: CAR_L, h: CAR_W, label: 'car' },
+        // Cars parked along the opposite curb (top), across from the spot
+        { x: 600, y: 374, w: CAR_L, h: CAR_W, label: 'car' },
+        { x: 720, y: 374, w: CAR_L, h: CAR_W, label: 'car' },
+        { x: 840, y: 374, w: CAR_L, h: CAR_W, label: 'car' },
+        // Right/bottom curb
+        { x: 450, y: 510, w: 900, h: 18, label: 'wall' },
+        // Opposite/top curb wall
+        { x: 450, y: 351, w: 900, h: 18, label: 'wall' },
+        // Lot boundary left/right
+        { x: 2,   y: 300, w: 8,  h: 600, label: 'wall' },
+        { x: 898, y: 300, w: 8,  h: 600, label: 'wall' },
+      ],
+    },
+
+    8: {
+      name: 'Perpendicular — Drive In, Cars Across the Aisle',
+      // Like level 4, but a full facing row of cars sits across a narrow aisle (mouths
+      // ~130px apart), so the rear can't swing far back — turning room is restricted.
+      startPose: { x: 250, y: 215, heading: 0 },
+      targetBay: { x: 450, y: 140, w: 60, h: 110, heading: -Math.PI / 2 },
+      obstacles: [
+        // Target row (top) — every bay filled except the target at 450
+        { x: 270, y: 170, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 330, y: 170, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 390, y: 170, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 510, y: 170, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 570, y: 170, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 630, y: 170, w: CAR_W, h: CAR_L, label: 'car' },
+        // Facing row across the aisle (all bays parked), pulled to the aisle-side front
+        { x: 270, y: 292.5, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 330, y: 292.5, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 390, y: 292.5, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 450, y: 292.5, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 510, y: 292.5, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 570, y: 292.5, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 630, y: 292.5, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 450, y: 80,  w: 900, h: 14, label: 'wall' },
+        { x: 450, y: 598, w: 900, h: 8,  label: 'wall' },
+        { x: 2,   y: 300, w: 8,  h: 600, label: 'wall' },
+        { x: 898, y: 300, w: 8,  h: 600, label: 'wall' },
+      ],
+    },
+
+    9: {
+      name: 'Perpendicular — Reverse In, Cars Across the Aisle',
+      // Like level 5, but with the same facing row across a narrow aisle restricting the
+      // reverse swing. Start to the right, shift to R, and back into the bay.
+      startPose: { x: 640, y: 215, heading: 0 },
+      targetBay: { x: 450, y: 140, w: 60, h: 110, heading: -Math.PI / 2 },
+      obstacles: [
+        { x: 270, y: 170, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 330, y: 170, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 390, y: 170, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 510, y: 170, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 570, y: 170, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 630, y: 170, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 270, y: 292.5, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 330, y: 292.5, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 390, y: 292.5, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 450, y: 292.5, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 510, y: 292.5, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 570, y: 292.5, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 630, y: 292.5, w: CAR_W, h: CAR_L, label: 'car' },
+        { x: 450, y: 80,  w: 900, h: 14, label: 'wall' },
+        { x: 450, y: 598, w: 900, h: 8,  label: 'wall' },
+        { x: 2,   y: 300, w: 8,  h: 600, label: 'wall' },
+        { x: 898, y: 300, w: 8,  h: 600, label: 'wall' },
+      ],
+    },
+
+    // ── Levels 10–12: same scenarios as 7–9 but every car is 25% larger (carScale BIG).
+    //    Parking spots are unchanged; obstacle cars are scaled and re-aligned to them.
+    10: {
+      name: 'Parallel — Larger Vehicles, Cars Across the Street',
+      carScale: BIG,
+      startPose: { x: 200, y: 430, heading: 0 },
+      targetBay: { x: 720, y: 470, w: 110, h: 52, heading: 0 },
+      obstacles: [
+        // Spot cars — bigger, inner edges still at the 665/775 spot markers
+        { x: 775 + CAR_L*BIG/2, y: 470, w: CAR_L*BIG, h: CAR_W*BIG, label: 'car' },
+        { x: 665 - CAR_L*BIG/2, y: 470, w: CAR_L*BIG, h: CAR_W*BIG, label: 'car' },
+        // Cars along the opposite curb, flush below the y=360 curb line
+        { x: 600, y: 360 + CAR_W*BIG/2, w: CAR_L*BIG, h: CAR_W*BIG, label: 'car' },
+        { x: 720, y: 360 + CAR_W*BIG/2, w: CAR_L*BIG, h: CAR_W*BIG, label: 'car' },
+        { x: 840, y: 360 + CAR_W*BIG/2, w: CAR_L*BIG, h: CAR_W*BIG, label: 'car' },
+        { x: 450, y: 510, w: 900, h: 18, label: 'wall' },
+        { x: 450, y: 351, w: 900, h: 18, label: 'wall' },
+        { x: 2,   y: 300, w: 8,  h: 600, label: 'wall' },
+        { x: 898, y: 300, w: 8,  h: 600, label: 'wall' },
+      ],
+    },
+
+    11: {
+      name: 'Perpendicular — Larger Vehicles, Drive In Across the Aisle',
+      carScale: BIG,
+      startPose: { x: 250, y: 217, heading: 0 },
+      targetBay: { x: 450, y: 140, w: 60, h: 110, heading: -Math.PI / 2 },
+      obstacles: [
+        // Target row (top), bigger, front bumpers at the ~197.5 mouth line
+        { x: 270, y: 197.5 - CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 330, y: 197.5 - CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 390, y: 197.5 - CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 510, y: 197.5 - CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 570, y: 197.5 - CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 630, y: 197.5 - CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        // Facing row across the aisle (mouth at 265), front bumpers at the aisle
+        { x: 270, y: 265 + CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 330, y: 265 + CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 390, y: 265 + CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 450, y: 265 + CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 510, y: 265 + CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 570, y: 265 + CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 630, y: 265 + CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 450, y: 80,  w: 900, h: 14, label: 'wall' },
+        { x: 450, y: 598, w: 900, h: 8,  label: 'wall' },
+        { x: 2,   y: 300, w: 8,  h: 600, label: 'wall' },
+        { x: 898, y: 300, w: 8,  h: 600, label: 'wall' },
+      ],
+    },
+
+    12: {
+      name: 'Perpendicular — Larger Vehicles, Reverse In Across the Aisle',
+      carScale: BIG,
+      startPose: { x: 640, y: 217, heading: 0 },
+      targetBay: { x: 450, y: 140, w: 60, h: 110, heading: -Math.PI / 2 },
+      obstacles: [
+        { x: 270, y: 197.5 - CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 330, y: 197.5 - CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 390, y: 197.5 - CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 510, y: 197.5 - CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 570, y: 197.5 - CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 630, y: 197.5 - CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 270, y: 265 + CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 330, y: 265 + CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 390, y: 265 + CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 450, y: 265 + CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 510, y: 265 + CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 570, y: 265 + CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 630, y: 265 + CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 450, y: 80,  w: 900, h: 14, label: 'wall' },
+        { x: 450, y: 598, w: 900, h: 8,  label: 'wall' },
+        { x: 2,   y: 300, w: 8,  h: 600, label: 'wall' },
+        { x: 898, y: 300, w: 8,  h: 600, label: 'wall' },
+      ],
+    },
+
+    // ── Levels 13–15: same as 10–12 (larger vehicles), every car in the same spot,
+    //    but the target spot is 25% narrower (w × 0.75) for a tighter fit.
+    13: {
+      name: 'Parallel — Larger Vehicles, Smaller Spot',
+      carScale: BIG,
+      startPose: { x: 200, y: 430, heading: 0 },
+      targetBay: { x: 720, y: 470, w: 110 * 0.75, h: 52, heading: 0 },
+      obstacles: [
+        { x: 775 + CAR_L*BIG/2, y: 470, w: CAR_L*BIG, h: CAR_W*BIG, label: 'car' },
+        { x: 665 - CAR_L*BIG/2, y: 470, w: CAR_L*BIG, h: CAR_W*BIG, label: 'car' },
+        { x: 600, y: 360 + CAR_W*BIG/2, w: CAR_L*BIG, h: CAR_W*BIG, label: 'car' },
+        { x: 720, y: 360 + CAR_W*BIG/2, w: CAR_L*BIG, h: CAR_W*BIG, label: 'car' },
+        { x: 840, y: 360 + CAR_W*BIG/2, w: CAR_L*BIG, h: CAR_W*BIG, label: 'car' },
+        { x: 450, y: 510, w: 900, h: 18, label: 'wall' },
+        { x: 450, y: 351, w: 900, h: 18, label: 'wall' },
+        { x: 2,   y: 300, w: 8,  h: 600, label: 'wall' },
+        { x: 898, y: 300, w: 8,  h: 600, label: 'wall' },
+      ],
+    },
+
+    14: {
+      name: 'Perpendicular — Larger Vehicles, Drive In, Smaller Spot',
+      carScale: BIG,
+      startPose: { x: 250, y: 217, heading: 0 },
+      targetBay: { x: 450, y: 140, w: 60 * 0.75, h: 110, heading: -Math.PI / 2 },
+      obstacles: [
+        { x: 270, y: 197.5 - CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 330, y: 197.5 - CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 390, y: 197.5 - CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 510, y: 197.5 - CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 570, y: 197.5 - CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 630, y: 197.5 - CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 270, y: 265 + CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 330, y: 265 + CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 390, y: 265 + CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 450, y: 265 + CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 510, y: 265 + CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 570, y: 265 + CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 630, y: 265 + CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 450, y: 80,  w: 900, h: 14, label: 'wall' },
+        { x: 450, y: 598, w: 900, h: 8,  label: 'wall' },
+        { x: 2,   y: 300, w: 8,  h: 600, label: 'wall' },
+        { x: 898, y: 300, w: 8,  h: 600, label: 'wall' },
+      ],
+    },
+
+    15: {
+      name: 'Perpendicular — Larger Vehicles, Reverse In, Smaller Spot',
+      carScale: BIG,
+      startPose: { x: 640, y: 217, heading: 0 },
+      targetBay: { x: 450, y: 140, w: 60 * 0.75, h: 110, heading: -Math.PI / 2 },
+      obstacles: [
+        { x: 270, y: 197.5 - CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 330, y: 197.5 - CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 390, y: 197.5 - CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 510, y: 197.5 - CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 570, y: 197.5 - CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 630, y: 197.5 - CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 270, y: 265 + CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 330, y: 265 + CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 390, y: 265 + CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 450, y: 265 + CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 510, y: 265 + CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 570, y: 265 + CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 630, y: 265 + CAR_L*BIG/2, w: CAR_W*BIG, h: CAR_L*BIG, label: 'car' },
+        { x: 450, y: 80,  w: 900, h: 14, label: 'wall' },
+        { x: 450, y: 598, w: 900, h: 8,  label: 'wall' },
+        { x: 2,   y: 300, w: 8,  h: 600, label: 'wall' },
+        { x: 898, y: 300, w: 8,  h: 600, label: 'wall' },
+      ],
+    },
+  };
+
+  // ─────────────────────────────────────────────────────────────────────────
+  //  GAME STATE
+  // ─────────────────────────────────────────────────────────────────────────
+  let car = {};            // { x, y, heading, speed, steerAngle }
+  // Effective player-car dimensions for the current level (scaled up on levels 10–12).
+  let carW = CAR_W, carL = CAR_L, wheelbase = WHEELBASE;
+  let currentMode = 1;
+  let keys = {};
+  let status = '';
+  let statusColor = '#fff';
+  let hitFlashEnd = 0;
+  let hintUntil = 0;       // transient status messages (shifting/finish hints) hold until this time
+  let parkedTime = null;
+  let startTime = null;
+  let elapsedStr = '';
+  let confetti = [];
+  let hitCount      = 0;
+  let reversalCount = 0;
+  let lastDriveGear = null;
+  let score         = null;
+  let scoreComponents = {};
+  let isNewBest     = false;
+  let gameState     = 'select'; // 'select' | 'playing'
+  let uiButtons     = [];       // rebuilt every frame; hit-tested on canvas click
+  let focusedLevel  = 1;        // keyboard-focused cell in level select grid
+  let focusedAction = 0;        // keyboard-focused button on score overlay (0=Retry,1=Next,2=Levels)
+
+  function resetCar() {
+    const pose = MODES[currentMode].startPose;
+    const scale = MODES[currentMode].carScale || 1;
+    carW = CAR_W * scale; carL = CAR_L * scale; wheelbase = WHEELBASE * scale;
+    car = {
+      x:          pose.x,
+      y:          pose.y,
+      heading:    pose.heading,
+      speed:      0,
+      steerAngle: 0,
+      gear:       'P',
+    };
+    status      = 'Shift to D (or R) and drive to the spot';
+    statusColor = '#ddd';
+    parkedTime  = null;
+    startTime   = performance.now();
+    elapsedStr  = '';
+    hitFlashEnd = 0;
+    hintUntil   = performance.now() + 1500;
+    confetti    = [];
+    hitCount = 0; reversalCount = 0; lastDriveGear = null;
+    score = null; scoreComponents = {}; isNewBest = false;
+    gameState    = 'select';
+    focusedLevel = currentMode;
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  //  INPUT
+  // ─────────────────────────────────────────────────────────────────────────
+  const PREVENT_KEYS = new Set([
+    'ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' ','Space','Backspace','Enter','Tab'
+  ]);
+
+  // Change gear only when nearly stopped; otherwise nudge the player to brake.
+  function tryShift(g) {
+    if (Math.abs(car.speed) < SHIFT_SPEED) {
+      if ((g === 'D' || g === 'R') && lastDriveGear !== null && lastDriveGear !== g) {
+        reversalCount++;
+      }
+      if (g === 'D' || g === 'R') lastDriveGear = g;
+      car.gear = g;
+    } else if (parkedTime === null) {
+      status      = 'Brake to a stop before shifting';
+      statusColor = '#ffaa44';
+      hintUntil   = performance.now() + 1200;
+    }
+  }
+
+  window.addEventListener('keydown', e => {
+    if (PREVENT_KEYS.has(e.key) || PREVENT_KEYS.has(e.code)) e.preventDefault();
+    keys[e.code] = true;
+    keys[e.key]  = true;
+
+    if (gameState === 'select') {
+      if (e.key === 'ArrowRight') focusedLevel = Math.min(15, focusedLevel + 1);
+      if (e.key === 'ArrowLeft')  focusedLevel = Math.max(1,  focusedLevel - 1);
+      if (e.key === 'ArrowDown')  focusedLevel = Math.min(15, focusedLevel + 5);
+      if (e.key === 'ArrowUp')    focusedLevel = Math.max(1,  focusedLevel - 5);
+      if (e.key === 'Enter') { currentMode = focusedLevel; resetCar(); gameState = 'playing'; }
+      return;
+    }
+    if (gameState === 'playing' && parkedTime !== null) {
+      if (e.key === 'ArrowRight' || (e.key === 'Tab' && !e.shiftKey))  focusedAction = (focusedAction + 1) % 3;
+      if (e.key === 'ArrowLeft'  || (e.key === 'Tab' &&  e.shiftKey))  focusedAction = (focusedAction + 2) % 3;
+      if (e.key === 'Enter') {
+        if      (focusedAction === 0) { resetCar(); gameState = 'playing'; }
+        else if (focusedAction === 1) { currentMode = currentMode < 15 ? currentMode + 1 : 1; resetCar(); gameState = 'playing'; }
+        else                          { focusedLevel = currentMode; gameState = 'select'; }
+      }
+      return;
+    }
+    if (e.key === 'd' || e.key === 'D') { tryShift('D'); }
+    if (e.key === 'r' || e.key === 'R') { tryShift('R'); }
+    if (e.key === 'p' || e.key === 'P') { tryShift('P'); }
+    if (e.key === 'Backspace')          { resetCar(); }
+  });
+
+  window.addEventListener('keyup', e => {
+    keys[e.code] = false;
+    keys[e.key]  = false;
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  //  MATH HELPERS
+  // ─────────────────────────────────────────────────────────────────────────
+  function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+  function sign(v) { return v < 0 ? -1 : v > 0 ? 1 : 0; }
+
+  // Return the four corners of an oriented rectangle
+  // cx,cy = center; w,h = full width/height; angle = heading (radians)
+  function rectCorners(cx, cy, w, h, angle) {
+    const cos = Math.cos(angle), sin = Math.sin(angle);
+    const hw = w / 2, hh = h / 2;
+    // local corners: [±hw, ±hh]
+    const pts = [
+      [ hw,  hh],
+      [-hw,  hh],
+      [-hw, -hh],
+      [ hw, -hh],
+    ];
+    return pts.map(([lx, ly]) => [
+      cx + lx * cos - ly * sin,
+      cy + lx * sin + ly * cos,
+    ]);
+  }
+
+  // Project corners onto axis, return [min, max]
+  function projectOnAxis(corners, ax, ay) {
+    let mn = Infinity, mx = -Infinity;
+    for (const [px, py] of corners) {
+      const d = px * ax + py * ay;
+      if (d < mn) mn = d;
+      if (d > mx) mx = d;
+    }
+    return [mn, mx];
+  }
+
+  // Separating Axis Theorem: overlap test for two oriented rects
+  // rectA: {cx,cy,w,h,angle}; obstB: axis-aligned {x,y,w,h} (center coords)
+  function satOverlap(rectA, obstB) {
+    const cornersA = rectCorners(rectA.cx, rectA.cy, rectA.w, rectA.h, rectA.angle);
+    const cornersB = rectCorners(obstB.x,  obstB.y,  obstB.w, obstB.h, 0);
+
+    // Axes to test: normals of both rects' edges
+    // rectA has two unique normal directions (cos,sin) and (-sin,cos)
+    // rectB is axis-aligned so its normals are (1,0) and (0,1)
+    const cos = Math.cos(rectA.angle), sin = Math.sin(rectA.angle);
+    const axes = [
+      [cos,  sin],   // rectA local X
+      [-sin, cos],   // rectA local Y
+      [1,    0  ],   // rectB world X
+      [0,    1  ],   // rectB world Y
+    ];
+
+    for (const [ax, ay] of axes) {
+      const [minA, maxA] = projectOnAxis(cornersA, ax, ay);
+      const [minB, maxB] = projectOnAxis(cornersB, ax, ay);
+      if (maxA < minB || maxB < minA) return false; // separating axis found
+    }
+    return true; // no separation on any axis → overlap
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  //  PHYSICS UPDATE — kinematic bicycle model
+  // ─────────────────────────────────────────────────────────────────────────
+  function updatePhysics(dt) {
+    const mode = MODES[currentMode];
+
+    // --- Pedals (direction comes from the gear, not the key) ---
+    const gas   = keys['ArrowUp'];
+    const brake = keys['ArrowDown'] || keys[' '] || keys['Space'];
+
+    if (car.gear === 'P') {
+      // Parked: locked. Bring any residual motion to rest quickly.
+      const decay = BRAKE_DECEL * dt;
+      if (Math.abs(car.speed) < decay) car.speed = 0;
+      else car.speed -= sign(car.speed) * decay;
+    } else if (brake) {
+      // Brake pedal: decay speed toward 0
+      const decay = BRAKE_DECEL * dt;
+      if (Math.abs(car.speed) < decay) car.speed = 0;
+      else car.speed -= sign(car.speed) * decay;
+    } else if (gas) {
+      // Accelerator pushes the car in the gear's direction
+      const dir = car.gear === 'D' ? 1 : -1;
+      car.speed += dir * ACCEL * dt;
+    } else {
+      // Natural friction/drag — always opposes motion
+      const drag = FRICTION * dt;
+      if (Math.abs(car.speed) < drag) car.speed = 0;
+      else car.speed -= sign(car.speed) * drag;
+    }
+
+    // Clamp by gear so the gas can't drive the wrong way
+    if (car.gear === 'D')      car.speed = clamp(car.speed, 0, MAX_SPEED_FWD);
+    else if (car.gear === 'R') car.speed = clamp(car.speed, -MAX_SPEED_REV, 0);
+    else                       car.speed = 0; // Park
+
+    // --- Steering ---
+    const steerLeft  = keys['ArrowLeft'];
+    const steerRight = keys['ArrowRight'];
+
+    if (steerLeft && !steerRight) {
+      car.steerAngle -= STEER_RATE * dt;
+    } else if (steerRight && !steerLeft) {
+      car.steerAngle += STEER_RATE * dt;
+    } else {
+      // Auto-center toward 0
+      const ret = STEER_RETURN * dt;
+      if (Math.abs(car.steerAngle) < ret) car.steerAngle = 0;
+      else car.steerAngle -= sign(car.steerAngle) * ret;
+    }
+    car.steerAngle = clamp(car.steerAngle, -MAX_STEER, MAX_STEER);
+
+    // --- Kinematic bicycle model ---
+    // CRITICAL: heading only changes when the car is moving (v ≠ 0).
+    // tan(steerAngle) drives the yaw rate proportional to speed.
+    if (Math.abs(car.speed) > 0.01) {
+      const yawRate = (car.speed / wheelbase) * Math.tan(car.steerAngle);
+      car.heading  += yawRate * dt;
+    }
+
+    // Tentative new position
+    const nx = car.x + car.speed * Math.cos(car.heading) * dt;
+    const ny = car.y + car.speed * Math.sin(car.heading) * dt;
+
+    // --- Collision detection ---
+    const carRect = { cx: nx, cy: ny, w: carL, h: carW, angle: car.heading };
+    let hit = false;
+    for (const obs of mode.obstacles) {
+      if (satOverlap(carRect, obs)) {
+        hit = true;
+        break;
+      }
+    }
+
+    if (hit) {
+      car.speed = 0;
+      hitFlashEnd  = performance.now() + HIT_FLASH_MS;
+      hitCount++;
+      status       = 'Bumped a car!';
+      statusColor  = '#ff6666';
+    } else {
+      car.x = nx;
+      car.y = ny;
+      // Update status if not already parked (don't stomp on transient hints)
+      if (parkedTime === null) {
+        const now = performance.now();
+        if (now > hitFlashEnd && now > hintUntil) {
+          status      = car.gear === 'P'
+            ? 'Shift to D (or R) and drive to the spot'
+            : 'Drive to the spot and stop in the bay';
+          statusColor = '#ddd';
+        }
+      }
+    }
+
+    // --- Off-lot detection ---
+    const margin = 30;
+    if (car.x < -margin || car.x > CANVAS_W + margin ||
+        car.y < -margin || car.y > CANVAS_H + margin) {
+      status      = 'Off the lot! Press ⌫ Backspace to reset.';
+      statusColor = '#ffaa44';
+    }
+
+    // --- Success check ---
+    if (parkedTime === null) {
+      checkParked();
+    }
+  }
+
+  function checkParked() {
+    const mode = MODES[currentMode];
+    const bay  = mode.targetBay;
+
+    // All 4 corners of the (oriented) car must be inside the axis-aligned bay rect.
+    const cos = Math.cos(car.heading), sin = Math.sin(car.heading);
+    const hw = carL / 2, hh = carW / 2;
+    const corners = [
+      [ hw,  hh], [ hw, -hh],
+      [-hw,  hh], [-hw, -hh],
+    ].map(([lx, ly]) => ({
+      x: car.x + lx * cos - ly * sin,
+      y: car.y + lx * sin + ly * cos,
+    }));
+    const inBay = corners.every(c =>
+      c.x >= bay.x - bay.w / 2 && c.x <= bay.x + bay.w / 2 &&
+      c.y >= bay.y - bay.h / 2 && c.y <= bay.y + bay.h / 2
+    );
+
+    // Heading within tolerance (handle wrap-around).
+    // A perpendicular/parallel bay is a valid park whether the car finished nose-in
+    // or nose-out, so accept a 180° flip (fold the difference into [-π/2, π/2]).
+    let hdiff = car.heading - bay.heading;
+    while (hdiff >  Math.PI) hdiff -= 2 * Math.PI;
+    while (hdiff < -Math.PI) hdiff += 2 * Math.PI;
+    if (hdiff >  Math.PI / 2) hdiff -= Math.PI;
+    else if (hdiff < -Math.PI / 2) hdiff += Math.PI;
+    const goodHeading = Math.abs(hdiff) < HEADING_TOL;
+
+    const goodSpeed = Math.abs(car.speed) < SPEED_TOL;
+
+    if (inBay && goodHeading && goodSpeed && car.gear === 'P') {
+      parkedTime    = performance.now();
+      focusedAction = 0;
+      const elapsedRaw = (parkedTime - startTime) / 1000;
+      const elapsed = elapsedRaw.toFixed(1);
+      elapsedStr  = elapsed + 's';
+      status      = `Parked! ✓  (${elapsedStr})`;
+      statusColor = '#44ff88';
+      spawnConfetti();
+      const timeScore    = Math.max(0, 300 - elapsedRaw * 5);
+      const cleanScore   = Math.max(0, 250 - hitCount * 100);
+      const headingScore = (1 - Math.abs(hdiff) / HEADING_TOL) * 150;
+      const dx = Math.abs(car.x - bay.x) / (bay.w / 2);
+      const dy = Math.abs(car.y - bay.y) / (bay.h / 2);
+      const centerScore  = (1 - (dx + dy) / 2) * 150;
+      const econScore    = Math.max(0, 150 - reversalCount * 30);
+      score = Math.round(timeScore + cleanScore + headingScore + centerScore + econScore);
+      scoreComponents = {
+        time:      Math.round(timeScore),
+        clean:     Math.round(cleanScore),
+        precision: Math.round(headingScore + centerScore),
+        economy:   Math.round(econScore),
+      };
+      const bestKey = `parking_best_${currentMode}`;
+      const prev = parseInt(localStorage.getItem(bestKey) || '0', 10);
+      isNewBest = score > prev;
+      if (isNewBest) localStorage.setItem(bestKey, score);
+    } else if (inBay && goodHeading && goodSpeed && car.gear !== 'P') {
+      // Lined up and stopped — just needs to be put in Park.
+      status      = 'Shift to P to finish';
+      statusColor = '#aaff66';
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  //  CELEBRATION
+  // ─────────────────────────────────────────────────────────────────────────
+  const CONFETTI_COLORS = ['#ff4d4d','#ff9900','#ffe600','#44ff88','#00cfff','#cc44ff','#ff66b3'];
+
+  function spawnConfetti() {
+    for (let i = 0; i < 80; i++) {
+      const angle = Math.random() * Math.PI * 2;
+      const speed = 60 + Math.random() * 220;
+      confetti.push({
+        x:    car.x,
+        y:    car.y,
+        vx:   Math.cos(angle) * speed,
+        vy:   Math.sin(angle) * speed - 80, // slight upward bias
+        rot:  Math.random() * Math.PI * 2,
+        rotV: (Math.random() - 0.5) * 10,
+        w:    4 + Math.random() * 5,
+        h:    6 + Math.random() * 6,
+        color: CONFETTI_COLORS[Math.floor(Math.random() * CONFETTI_COLORS.length)],
+        life:  1.0,          // 0–1, fades to 0
+        decay: 0.55 + Math.random() * 0.3,  // life lost per second
+      });
+    }
+  }
+
+  function updateConfetti(dt) {
+    for (const p of confetti) {
+      p.x   += p.vx * dt;
+      p.y   += p.vy * dt;
+      p.vy  += 280 * dt;   // gravity
+      p.vx  *= 1 - 1.2 * dt; // air drag
+      p.rot += p.rotV * dt;
+      p.life -= p.decay * dt;
+    }
+    confetti = confetti.filter(p => p.life > 0);
+  }
+
+  function drawConfetti() {
+    for (const p of confetti) {
+      ctx.save();
+      ctx.globalAlpha = Math.max(0, p.life);
+      ctx.translate(p.x, p.y);
+      ctx.rotate(p.rot);
+      ctx.fillStyle = p.color;
+      ctx.fillRect(-p.w / 2, -p.h / 2, p.w, p.h);
+      ctx.restore();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawScoreOverlay(now) {
+    if (score === null) return;
+    const alpha = Math.min(1, (now - parkedTime) / 300);
+    const pw = 380, ph = 262;
+    const px = (CANVAS_W - pw) / 2, py = (CANVAS_H - ph) / 2 - 10;
+
+    ctx.save();
+    ctx.globalAlpha = alpha;
+
+    ctx.fillStyle = 'rgba(10,10,20,0.88)';
+    drawRoundedRect(ctx, px, py, pw, ph, 12);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(100,200,100,0.5)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 52px Segoe UI, Arial, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(score, CANVAS_W / 2, py + 68);
+
+    ctx.font = '13px Segoe UI, Arial, sans-serif';
+    ctx.fillStyle = '#aaa';
+    ctx.fillText('/ 1000', CANVAS_W / 2, py + 88);
+
+    const comps = [
+      ['Time',      scoreComponents.time,      300],
+      ['Clean',     scoreComponents.clean,     250],
+      ['Precision', scoreComponents.precision, 300],
+      ['Economy',   scoreComponents.economy,   150],
+    ];
+    const colW = pw / 4;
+    comps.forEach(([label, val, max], i) => {
+      const cx = px + colW * i + colW / 2;
+      ctx.fillStyle = '#888';
+      ctx.font = '12px monospace';
+      ctx.fillText(label, cx, py + 118);
+      ctx.fillStyle = val === max ? '#44ff88' : '#fff';
+      ctx.font = 'bold 16px monospace';
+      ctx.fillText(val, cx, py + 140);
+    });
+
+    const bestKey = `parking_best_${currentMode}`;
+    const best = parseInt(localStorage.getItem(bestKey) || '0', 10);
+    ctx.font = 'bold 14px Segoe UI, Arial, sans-serif';
+    if (isNewBest) {
+      ctx.fillStyle = '#ffd700';
+      ctx.fillText('★ New Best!', CANVAS_W / 2, py + 172);
+    } else {
+      ctx.fillStyle = '#777';
+      ctx.fillText(`Best: ${best}`, CANVAS_W / 2, py + 172);
+    }
+
+    // Action buttons inside the panel
+    const btnDefs = [
+      { label: '↺ Retry',   border: '#44aa44', bg: 'rgba(20,50,20,0.9)',
+        action: () => { resetCar(); gameState = 'playing'; } },
+      { label: 'Next →',    border: '#4488ff', bg: 'rgba(10,30,70,0.9)',
+        action: () => { currentMode = currentMode < 15 ? currentMode + 1 : 1; resetCar(); gameState = 'playing'; } },
+      { label: '⊞ Levels',  border: '#888',    bg: 'rgba(40,40,40,0.9)',
+        action: () => { focusedLevel = currentMode; gameState = 'select'; } },
+    ];
+    const bw = 100, bh = 32, bgap = 10;
+    const bx0 = px + (pw - (btnDefs.length * bw + (btnDefs.length - 1) * bgap)) / 2;
+    const by0 = py + 200;
+    btnDefs.forEach((bd, i) => {
+      const bx = bx0 + i * (bw + bgap);
+      ctx.fillStyle = bd.bg;
+      drawRoundedRect(ctx, bx, by0, bw, bh, 6); ctx.fill();
+      ctx.strokeStyle = bd.border; ctx.lineWidth = 1.5;
+      drawRoundedRect(ctx, bx, by0, bw, bh, 6); ctx.stroke();
+      ctx.fillStyle = bd.border;
+      ctx.font = 'bold 12px Segoe UI, Arial, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(bd.label, bx + bw / 2, by0 + 21);
+      if (i === focusedAction) {
+        ctx.save();
+        ctx.strokeStyle = '#ffe066';
+        ctx.lineWidth = 2.5;
+        ctx.shadowColor = '#ffe066';
+        ctx.shadowBlur = 10;
+        drawRoundedRect(ctx, bx - 1, by0 - 1, bw + 2, bh + 2, 7); ctx.stroke();
+        ctx.restore();
+      }
+      uiButtons.push({ x: bx, y: by0, w: bw, h: bh, action: bd.action });
+    });
+
+    ctx.restore();
+  }
+
+  function drawLevelSelect() {
+    // Full-screen dark overlay
+    ctx.fillStyle = 'rgba(0,0,0,0.82)';
+    ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+
+    // Title
+    ctx.fillStyle = '#aad4ff';
+    ctx.font = 'bold 20px Segoe UI, Arial, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('SELECT LEVEL', CANVAS_W / 2, 42);
+
+    // Top action buttons: [← Retry] and [Next →]
+    const nextMode = currentMode < 15 ? currentMode + 1 : 1;
+    const topBtns = [
+      { x: 40, y: 56, w: 200, h: 36, label: `← Retry  Level ${currentMode}`,
+        border: '#44aa44', bg: 'rgba(20,50,20,0.9)',
+        action: () => { resetCar(); gameState = 'playing'; } },
+      { x: 660, y: 56, w: 200, h: 36, label: `Level ${nextMode}  →`,
+        border: '#4488ff', bg: 'rgba(10,30,70,0.9)',
+        action: () => { currentMode = nextMode; resetCar(); gameState = 'playing'; } },
+    ];
+    for (const b of topBtns) {
+      ctx.fillStyle = b.bg;
+      drawRoundedRect(ctx, b.x, b.y, b.w, b.h, 7); ctx.fill();
+      ctx.strokeStyle = b.border; ctx.lineWidth = 1.5;
+      drawRoundedRect(ctx, b.x, b.y, b.w, b.h, 7); ctx.stroke();
+      ctx.fillStyle = b.border;
+      ctx.font = 'bold 13px Segoe UI, Arial, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(b.label, b.x + b.w / 2, b.y + 23);
+      uiButtons.push(b);
+    }
+
+    // 5×3 level grid
+    const cols = 5, btnW = 152, btnH = 76, gap = 10;
+    const gridW = cols * btnW + (cols - 1) * gap;
+    const gridX = (CANVAS_W - gridW) / 2;
+    const gridY = 108;
+
+    for (let i = 0; i < 15; i++) {
+      const lvl = i + 1;
+      const col = i % cols;
+      const row = Math.floor(i / cols);
+      const bx = gridX + col * (btnW + gap);
+      const by = gridY + row * (btnH + gap);
+      const isCurrent = lvl === currentMode;
+      const bestStr = localStorage.getItem(`parking_best_${lvl}`);
+
+      ctx.fillStyle = isCurrent ? 'rgba(20,50,100,0.95)' : 'rgba(25,30,45,0.9)';
+      drawRoundedRect(ctx, bx, by, btnW, btnH, 8); ctx.fill();
+      ctx.strokeStyle = isCurrent ? '#4488ff' : (bestStr ? '#336633' : '#444');
+      ctx.lineWidth = isCurrent ? 2 : 1;
+      drawRoundedRect(ctx, bx, by, btnW, btnH, 8); ctx.stroke();
+
+      ctx.fillStyle = isCurrent ? '#fff' : '#ccc';
+      ctx.font = 'bold 20px Segoe UI, Arial, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(lvl, bx + btnW / 2, by + 26);
+
+      const name = MODES[lvl].name;
+      const short = name.length > 24 ? name.slice(0, 23) + '…' : name;
+      ctx.fillStyle = isCurrent ? '#aad4ff' : '#777';
+      ctx.font = '10px Segoe UI, Arial, sans-serif';
+      ctx.fillText(short, bx + btnW / 2, by + 44);
+
+      ctx.fillStyle = bestStr ? '#44ff88' : '#444';
+      ctx.font = bestStr ? 'bold 11px monospace' : '11px monospace';
+      ctx.fillText(bestStr ? `★ ${bestStr}` : '—', bx + btnW / 2, by + 62);
+
+      // Keyboard focus ring (drawn on top of everything else for this cell)
+      if (lvl === focusedLevel) {
+        ctx.save();
+        ctx.strokeStyle = '#ffe066';
+        ctx.lineWidth = 2.5;
+        ctx.shadowColor = '#ffe066';
+        ctx.shadowBlur = 10;
+        drawRoundedRect(ctx, bx - 1, by - 1, btnW + 2, btnH + 2, 9); ctx.stroke();
+        ctx.restore();
+      }
+
+      const capturedLvl = lvl;
+      uiButtons.push({ x: bx, y: by, w: btnW, h: btnH,
+        action: () => { currentMode = capturedLvl; resetCar(); gameState = 'playing'; } });
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  //  RENDERING
+  // ─────────────────────────────────────────────────────────────────────────
+  const canvas = document.getElementById('c');
+  const ctx    = canvas.getContext('2d');
+
+  function drawRoundedRect(ctx, x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.lineTo(x + w - r, y);
+    ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+    ctx.lineTo(x + w, y + h - r);
+    ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+    ctx.lineTo(x + r, y + h);
+    ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+    ctx.lineTo(x, y + r);
+    ctx.quadraticCurveTo(x, y, x + r, y);
+    ctx.closePath();
+  }
+
+  // Draw an oriented rectangle by rotating the canvas context
+  function drawOrientedRect(cx, cy, w, h, angle, fillStyle, strokeStyle, lineWidth) {
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(angle);
+    ctx.beginPath();
+    drawRoundedRect(ctx, -w/2, -h/2, w, h, 4);
+    if (fillStyle)  { ctx.fillStyle   = fillStyle;  ctx.fill();   }
+    if (strokeStyle){ ctx.strokeStyle = strokeStyle; ctx.lineWidth = lineWidth || 1; ctx.stroke(); }
+    ctx.restore();
+  }
+
+  function drawCar() {
+    const { x, y, heading, steerAngle } = car;
+
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(heading);
+
+    // Car body
+    ctx.beginPath();
+    drawRoundedRect(ctx, -carL/2, -carW/2, carL, carW, 5);
+    ctx.fillStyle = CLR_CAR_BODY;
+    ctx.fill();
+    ctx.strokeStyle = '#1e40af';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    // Windshield (front area highlight)
+    ctx.fillStyle = 'rgba(160,210,255,0.45)';
+    ctx.fillRect(carL/2 - carL*0.35 - 2, -carW/2 + 2, carL*0.35, carW - 4);
+
+    // Nose marker (orange stripe at front)
+    ctx.fillStyle = CLR_CAR_NOSE;
+    ctx.fillRect(carL/2 - 5, -carW/2 + 2, 5, carW - 4);
+
+    // --- Front wheels (steer) ---
+    const wheelW = 5, wheelH = 10;
+    const fwdX   =  carL / 2 - carL * 0.22; // front axle X (in car local space)
+    const rearX  = -carL / 2 + carL * 0.22; // rear  axle X
+    const axleY  = carW / 2 - 1;
+
+    // Front-left wheel
+    ctx.save();
+    ctx.translate(fwdX, -axleY);
+    ctx.rotate(steerAngle);
+    ctx.fillStyle = '#111';
+    ctx.fillRect(-wheelH/2, -wheelW/2, wheelH, wheelW);
+    ctx.restore();
+
+    // Front-right wheel
+    ctx.save();
+    ctx.translate(fwdX, axleY);
+    ctx.rotate(steerAngle);
+    ctx.fillStyle = '#111';
+    ctx.fillRect(-wheelH/2, -wheelW/2, wheelH, wheelW);
+    ctx.restore();
+
+    // Rear-left wheel (fixed)
+    ctx.fillStyle = '#111';
+    ctx.fillRect(rearX - wheelH/2, -axleY - wheelW/2, wheelH, wheelW);
+    // Rear-right wheel
+    ctx.fillRect(rearX - wheelH/2,  axleY - wheelW/2, wheelH, wheelW);
+
+    ctx.restore();
+  }
+
+  function drawBayLines(x, y, w, h, angle, bayColor) {
+    // Draw target bay as coloured rectangle with white border
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(angle);
+
+    ctx.fillStyle = bayColor;
+    ctx.strokeStyle = '#ffffffcc';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.rect(-w/2, -h/2, w, h);
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.restore();
+  }
+
+  // Opposite (facing) row of perpendicular bays for levels 8/9; its mouth sits at OPP_BAY_TOP.
+  // Aisle = OPP_BAY_TOP − 200 (top-bay mouth). 265 ⇒ a 65px aisle (half of the original 130).
+  const OPP_BAY_TOP = 265;
+
+  function drawParkingLines_Perp() {
+    const bayH    = 115;
+    const bayW    = 60;
+    const numBays = 7;
+    const startX  = CANVAS_W / 2 - (numBays / 2) * bayW;
+
+    ctx.strokeStyle = CLR_LINE;
+    ctx.lineWidth   = 2;
+
+    const drawRow = (bayTop) => {
+      // Horizontal lines (top and bottom of bays)
+      ctx.beginPath();
+      ctx.moveTo(startX, bayTop);
+      ctx.lineTo(startX + numBays * bayW, bayTop);
+      ctx.moveTo(startX, bayTop + bayH);
+      ctx.lineTo(startX + numBays * bayW, bayTop + bayH);
+      ctx.stroke();
+      // Vertical separators
+      for (let i = 0; i <= numBays; i++) {
+        ctx.beginPath();
+        ctx.moveTo(startX + i * bayW, bayTop);
+        ctx.lineTo(startX + i * bayW, bayTop + bayH);
+        ctx.stroke();
+      }
+    };
+
+    drawRow(85); // top row (bays open downward toward the aisle)
+    if ([8, 9, 11, 12, 14, 15].includes(currentMode)) {
+      drawRow(OPP_BAY_TOP); // facing row across the aisle
+    }
+  }
+
+  function drawParkingLines_Parallel() {
+    // A straight lane with a curb on the right
+    // Draw the road lane lines
+    ctx.strokeStyle = CLR_LINE;
+    ctx.lineWidth   = 2;
+
+    // Right curb (solid white)
+    ctx.beginPath();
+    ctx.moveTo(0,   500);
+    ctx.lineTo(900, 500);
+    ctx.stroke();
+
+    if (currentMode === 7 || currentMode === 10 || currentMode === 13) {
+      // Opposite curb (solid white) — cars park along it, narrowing the street.
+      ctx.strokeStyle = CLR_LINE;
+      ctx.beginPath();
+      ctx.moveTo(0,   360);
+      ctx.lineTo(900, 360);
+      ctx.stroke();
+    } else {
+      // Left lane edge (dashed yellow)
+      ctx.strokeStyle = '#ffd700cc';
+      ctx.setLineDash([20, 15]);
+      ctx.beginPath();
+      ctx.moveTo(0,   350);
+      ctx.lineTo(900, 350);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    // Parallel parking zone markers (short perpendicular lines)
+    const spotX  = 720;
+    const spotHW = 55;
+    const curbY  = 500;
+    ctx.strokeStyle = '#ffffffbb';
+    ctx.lineWidth   = 2;
+    ctx.beginPath();
+    ctx.moveTo(spotX - spotHW, curbY);
+    ctx.lineTo(spotX - spotHW, curbY - 55);
+    ctx.moveTo(spotX + spotHW, curbY);
+    ctx.lineTo(spotX + spotHW, curbY - 55);
+    ctx.stroke();
+  }
+
+  function drawObstacles() {
+    const obstacles = MODES[currentMode].obstacles;
+    for (const obs of obstacles) {
+      if (obs.label === 'wall') {
+        // Draw walls as kerb/barrier
+        drawOrientedRect(obs.x, obs.y, obs.w, obs.h, 0, '#2a2a2a', '#555', 1);
+      } else {
+        // Parked car
+        ctx.save();
+        ctx.translate(obs.x, obs.y);
+        // Determine orientation: if taller than wide, rotate 0; else already horizontal
+        const angle = obs.h > obs.w ? 0 : 0; // axis-aligned, no rotation needed
+        ctx.rotate(angle);
+        ctx.beginPath();
+        drawRoundedRect(ctx, -obs.w/2, -obs.h/2, obs.w, obs.h, 5);
+        ctx.fillStyle   = CLR_PARKED_CAR;
+        ctx.fill();
+        ctx.strokeStyle = '#888';
+        ctx.lineWidth   = 1.5;
+        ctx.stroke();
+        // Windshield tint
+        if (obs.h > obs.w) {
+          // vertical car
+          ctx.fillStyle = 'rgba(120,180,220,0.3)';
+          ctx.fillRect(-obs.w/2 + 2, -obs.h/2 + 2, obs.w - 4, obs.h * 0.3);
+        } else {
+          // horizontal car
+          ctx.fillStyle = 'rgba(120,180,220,0.3)';
+          ctx.fillRect(-obs.w/2 + 2, -obs.h/2 + 2, obs.w * 0.3, obs.h - 4);
+        }
+        ctx.restore();
+      }
+    }
+  }
+
+  function render(now) {
+    uiButtons = []; // rebuild hit-areas each frame
+
+    // Background
+    ctx.fillStyle = CLR_ASPHALT;
+    ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+
+    const bay = MODES[currentMode].targetBay;
+
+    // Level-specific markings first (under obstacles/car)
+    if (currentMode === 3 || currentMode === 6 || currentMode === 7 || currentMode === 10 || currentMode === 13) {
+      drawParkingLines_Parallel();
+    } else {
+      drawParkingLines_Perp();
+    }
+
+    // Target bay highlight — bays are axis-aligned rectangles; draw at angle=0.
+    // (bay.heading is used only for the success heading check, not for drawing shape.)
+    let bayFill = CLR_BAY_IDLE;
+    if (parkedTime !== null) bayFill = CLR_BAY_OK;
+    else if (now < hitFlashEnd) bayFill = CLR_BAY_HIT;
+    drawBayLines(bay.x, bay.y, bay.w, bay.h, 0, bayFill);
+
+    // Pulsing glow ring when parked (stops after 3 s)
+    if (parkedTime !== null && (now - parkedTime) < 3000) {
+      const age = (now - parkedTime) / 1000;
+      const pulse = (Math.sin(age * 5) + 1) / 2; // 0–1, 2.5 Hz
+      ctx.save();
+      ctx.strokeStyle = `rgba(50,255,120,${0.25 + pulse * 0.55})`;
+      ctx.lineWidth   = 3 + pulse * 5;
+      ctx.shadowColor = '#44ff88';
+      ctx.shadowBlur  = 12 + pulse * 18;
+      ctx.beginPath();
+      ctx.rect(bay.x - bay.w / 2 - 3, bay.y - bay.h / 2 - 3, bay.w + 6, bay.h + 6);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // Obstacles (parked cars, walls)
+    drawObstacles();
+
+    // Player car
+    drawCar();
+
+    // Celebration confetti (above car, below HUD)
+    drawConfetti();
+    if (gameState === 'playing') drawScoreOverlay(now);
+
+    // ── HUD overlay ──
+    // Mode name banner
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.fillRect(0, 0, CANVAS_W, 32);
+    ctx.fillStyle = '#aad4ff';
+    ctx.font      = 'bold 14px Segoe UI, Arial, sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText(`Level ${currentMode}: ${MODES[currentMode].name}`, 12, 21);
+
+    // Status line
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(0, CANVAS_H - 36, CANVAS_W, 36);
+    ctx.fillStyle   = statusColor;
+    ctx.font        = 'bold 15px Segoe UI, Arial, sans-serif';
+    ctx.textAlign   = 'center';
+    ctx.fillText(status, CANVAS_W / 2, CANVAS_H - 14);
+
+    // Speed readout (right side)
+    ctx.fillStyle = '#aaa';
+    ctx.font      = '12px monospace';
+    ctx.textAlign = 'right';
+    ctx.fillText(`spd: ${Math.abs(car.speed).toFixed(0)} px/s`, CANVAS_W - 10, CANVAS_H - 14);
+
+    // Gear indicator (left side): P R D, active one highlighted
+    ctx.textAlign = 'left';
+    ctx.font      = 'bold 14px monospace';
+    const gears   = ['P', 'R', 'D'];
+    let gx = 12;
+    const gy = CANVAS_H - 12;
+    for (const g of gears) {
+      const active = car.gear === g;
+      if (active) {
+        ctx.fillStyle = '#ffd24a';
+        ctx.fillRect(gx - 3, gy - 14, 18, 19);
+        ctx.fillStyle = '#222';
+      } else {
+        ctx.fillStyle = '#777';
+      }
+      ctx.fillText(g, gx, gy);
+      gx += 24;
+    }
+
+    // Level select overlay (drawn last, on top of everything)
+    if (gameState === 'select') drawLevelSelect();
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  //  GAME LOOP
+  // ─────────────────────────────────────────────────────────────────────────
+  let lastTime = null;
+
+  function gameLoop(now) {
+    if (lastTime === null) lastTime = now;
+    let dt = (now - lastTime) / 1000; // seconds
+    lastTime = now;
+
+    // Clamp dt so a tab freeze doesn't cause a giant jump
+    if (dt > 0.05) dt = 0.05;
+
+    if (gameState === 'playing') updatePhysics(dt);
+    updateConfetti(dt);
+    render(now);
+
+    requestAnimationFrame(gameLoop);
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  //  INIT
+  // ─────────────────────────────────────────────────────────────────────────
+  resetCar();
+
+  canvas.addEventListener('click', e => {
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = CANVAS_W / rect.width;
+    const scaleY = CANVAS_H / rect.height;
+    const mx = (e.clientX - rect.left) * scaleX;
+    const my = (e.clientY - rect.top) * scaleY;
+    for (const btn of uiButtons) {
+      if (mx >= btn.x && mx <= btn.x + btn.w && my >= btn.y && my <= btn.y + btn.h) {
+        btn.action();
+        break;
+      }
+    }
+  });
+
+  requestAnimationFrame(gameLoop);
+  </script>
+</body>
+</html>
